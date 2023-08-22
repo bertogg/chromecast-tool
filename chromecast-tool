@@ -135,7 +135,7 @@ connect_wifi () {
     echo "done"
 
     # Encrypt the wifi password
-    KEYFILE=$(mktemp /tmp/cast.XXXXXX)
+    KEYFILE=$(mktemp ${TMPDIR:-/tmp}/cast.XXXXXX)
     trap "rm -f $KEYFILE" EXIT
     trap true INT
     echo '-----BEGIN PUBLIC KEY-----' > $KEYFILE
