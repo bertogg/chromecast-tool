@@ -1,0 +1,217 @@
+#!/bin/sh
+
+# Copyright (C) 2023 Alberto Garcia <berto@igalia.com>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or (at
+# your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+set -e
+
+CURL="curl -s --insecure --tlsv1.2 --tls-max 1.2"
+
+abort () {
+    echo "$1" >&2
+    exit 1
+}
+
+show_usage () {
+    cat <<-EOF
+	Usage: chromecast-tool [command] [options]
+
+	Available commands:
+	   connect-wifi   Connect the Chromecast to a Wifi network.
+	   get-config     Show the current Chromecast settings.
+	   set-config     Change some of the Chromecast settings.
+	   get-locales    Get list of supported locales.
+	   get-timezones  Get list of supported timezones.
+
+	Generic options:
+	   --help         Output this help.
+	   --addr         IP address of the Chromecast (autodetect if unset).
+	                  (autodetection only works if this computer is
+	                  connected to the Chromecast's built-in network)
+
+	Options for the 'connect-wifi' command:
+	   --ssid         Connect the Chromecast to this network.
+	   --pass         Wifi password.
+
+	Options for the 'set-config' command:
+	   --name         Set the visible name of the Chromecast.
+	   --locale       Set the locale (es, fi, en-US, ja, ...).
+	   --timezone     Set the time zone (Europe/Madrid, Asia/Tokyo, ...).
+	   --timeformat   Set the time format (1 for 12-hour, 2 for 24-hour).
+EOF
+    exit 0
+}
+
+require_cmd () {
+    for cmd in "$@"; do
+        command -v $cmd > /dev/null || abort "ERROR: $cmd not found"
+    done
+}
+
+parse_options () {
+    local OPTNAMES="help,addr:,$1"
+    shift
+    local OPTS=$(getopt -s sh -l ${OPTNAMES%,} -n chromecast-tool -- "" "$@")
+    eval set -- "$OPTS"
+
+    while true; do
+        case "$1" in
+            --ssid) WIFI_SSID="$2"; shift 2 ;;
+            --pass) WIFI_PASS="$2"; shift 2 ;;
+            --addr) CHROMECAST_IP="$2"; shift 2 ;;
+            --name) OPT_NAME="$2"; shift 2 ;;
+            --locale) OPT_LOCALE="$2"; shift 2 ;;
+            --timezone) OPT_TZ="$2"; shift 2 ;;
+            --timeformat) OPT_TFORMAT="$2"; shift 2 ;;
+            --help) show_usage ;;
+            --) shift; break ;;
+        esac
+    done
+
+    if [ "$#" -gt 0 ]; then
+        abort "Unknown option '$1'"
+    fi
+
+    if [ -z "${CHROMECAST_IP}" ]; then
+        require_cmd ip
+        CHROMECAST_IP=$(ip route show default | cut -d ' ' -f 3)
+    fi
+
+    if [ -z "${CHROMECAST_IP}" ]; then
+        abort "ERROR: IP address not specified"
+    fi
+}
+
+get_chromecast_info () {
+    echo -n "Trying to connect to the Chromecast with IP ${CHROMECAST_IP} ... "
+    CHROMECAST_INFO="$($CURL https://${CHROMECAST_IP}:8443/setup/eureka_info || true)"
+    CHROMECAST_NAME="$(echo "${CHROMECAST_INFO}" | jq -r '.name')"
+    CHROMECAST_LOCALE="$(echo "${CHROMECAST_INFO}" | jq -r '.locale')"
+    CHROMECAST_TZ="$(echo "${CHROMECAST_INFO}" | jq -r '.timezone')"
+    CHROMECAST_TFORMAT="$(echo "${CHROMECAST_INFO}" | jq -r '.time_format')"
+    CHROMECAST_SSID="$(echo "${CHROMECAST_INFO}" | jq -r '.ssid')"
+    CHROMECAST_PUBKEY="$(echo "${CHROMECAST_INFO}" | jq -r '.public_key')"
+    [ -n "$CHROMECAST_NAME" ] || abort "ERROR"
+    echo "done"
+
+    cat <<-EOF
+	Current Chromecast settings:
+	   Name: $CHROMECAST_NAME
+	   Configured wifi network: ${CHROMECAST_SSID:-(none)}
+	   Locale: $CHROMECAST_LOCALE
+	   Timezone: $CHROMECAST_TZ
+	   Time format: $CHROMECAST_TFORMAT
+EOF
+}
+
+connect_wifi () {
+    require_cmd openssl
+    parse_options "ssid:,pass:" "$@"
+
+    if [ -z "${WIFI_SSID}" -o -z "${WIFI_PASS}" ]; then
+        abort "ERROR: both --ssid and --pass must be specified"
+    fi
+
+    get_chromecast_info
+    echo -n "Scanning wifi networks 0%..."
+    $CURL -X POST https://${CHROMECAST_IP}:8443/setup/scan_wifi
+    for f in $(seq 10 10 90); do
+        echo -n "${f}%..."
+        sleep 1
+    done
+    echo "100%"
+
+    echo -n "Getting the details of the $WIFI_SSID network from the scan results ... "
+    RESULT="$($CURL https://${CHROMECAST_IP}:8443/setup/scan_results)"
+    WIFI_DETAILS="$(echo "${RESULT}" | jq ".[] | select(.ssid == \"${WIFI_SSID}\")")"
+    [ -n "$WIFI_DETAILS" ] || abort "ERROR: wifi network with SSID $WIFI_SSID not found"
+    WPA_AUTH="$(echo "${WIFI_DETAILS}" | jq -r '.wpa_auth')"
+    WPA_CIPHER="$(echo "${WIFI_DETAILS}" | jq -r '.wpa_cipher')"
+    echo "done"
+
+    # Encrypt the wifi password
+    KEYFILE=$(mktemp /tmp/cast.XXXXXX)
+    trap "rm -f $KEYFILE" EXIT
+    trap true INT
+    echo '-----BEGIN PUBLIC KEY-----' > $KEYFILE
+    echo "$CHROMECAST_PUBKEY"        >> $KEYFILE
+    echo '-----END PUBLIC KEY-----'  >> $KEYFILE
+    ENC_PASSWORD=$(echo -n "$WIFI_PASS" | openssl pkeyutl -encrypt -inkey $KEYFILE -pubin | base64 -w 0)
+
+    echo -n "Connecting Chromecast to the $WIFI_SSID network ..."
+    CMD="{\"ssid\": \"${WIFI_SSID}\", \"wpa_auth\": ${WPA_AUTH}, \"wpa_cipher\": ${WPA_CIPHER}, \"enc_passwd\": \"${ENC_PASSWORD}\"}"
+    $CURL -H "content-type: application/json" -d "${CMD}" https://${CHROMECAST_IP}:8443/setup/connect_wifi
+    echo "done"
+
+    echo -n "Saving changes ..."
+    CMD="{\"keep_hotspot_until_connected\": true}"
+    $CURL -H "content-type: application/json" -d "${CMD}" -o /dev/null https://${CHROMECAST_IP}:8443/setup/save_wifi
+    echo "done"
+}
+
+get_config () {
+    parse_options "" "$@"
+    get_chromecast_info
+}
+
+set_config () {
+    parse_options "name:,locale:,timezone:,timeformat:" "$@"
+
+    local CMD="\"settings\": {"
+    [ -n "$OPT_LOCALE" ]  && CMD="${CMD} \"locale\": \"${OPT_LOCALE}\","
+    [ -n "$OPT_TZ" ]      && CMD="${CMD} \"timezone\": \"${OPT_TZ}\","
+    [ -n "$OPT_TFORMAT" ] && CMD="${CMD} \"time_format\": ${OPT_TFORMAT},"
+    CMD="${CMD%,} }" # Remove the trailing comma and close the 'settings' brace
+
+    [ -n "$OPT_NAME" ] && CMD="\"name\": \"${OPT_NAME}\", ${CMD}"
+
+    CMD="{${CMD}}"
+    echo -n "Changing the Chromecast settings ..."
+    $CURL -H "content-type: application/json" -d "${CMD}" -o /dev/null https://${CHROMECAST_IP}:8443/setup/set_eureka_info
+    echo "done"
+}
+
+get_locales () {
+    parse_options "" "$@"
+
+    echo -n "Trying to connect to the Chromecast with IP ${CHROMECAST_IP} ... "
+    RESULT="$($CURL https://${CHROMECAST_IP}:8443/setup/supported_locales || true)"
+    [ -n "$RESULT" ] || abort "ERROR"
+    echo "done"
+    echo $RESULT | jq -r '.[] | .locale'
+}
+
+get_timezones () {
+    parse_options "" "$@"
+
+    echo -n "Trying to connect to the Chromecast with IP ${CHROMECAST_IP} ... "
+    RESULT="$($CURL https://${CHROMECAST_IP}:8443/setup/supported_timezones || true)"
+    [ -n "$RESULT" ] || abort "ERROR"
+    echo "done"
+    echo $RESULT | jq -r '.[] | .timezone'
+}
+
+[ "$#" = 0 ] && show_usage
+
+require_cmd curl jq
+
+case "$1" in
+    connect-wifi)  shift; connect_wifi "$@";;
+    get-config)    shift; get_config "$@";;
+    set-config)    shift; set_config "$@";;
+    get-locales)   shift; get_locales "$@";;
+    get-timezones) shift; get_timezones "$@";;
+    *) abort "Unknown command '$1'";;
+esac
