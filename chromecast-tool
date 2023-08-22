@@ -37,9 +37,8 @@ show_usage () {
 
 	Generic options:
 	   --help         Output this help.
-	   --addr         IP address of the Chromecast (autodetect if unset).
-	                  (autodetection only works if this computer is
-	                  connected to the Chromecast's built-in network)
+	   --addr         IP address of the Chromecast (192.168.255.249 if unset).
+	                  (192.168.255.249 is the default IP after a factory reset)
 
 	Options for the 'connect-wifi' command:
 	   --ssid         Connect the Chromecast to this network.
@@ -66,6 +65,9 @@ parse_options () {
     local OPTS=$(getopt -s sh -l ${OPTNAMES%,} -n chromecast-tool -- "" "$@")
     eval set -- "$OPTS"
 
+    # Default address after a factory reset
+    CHROMECAST_IP=192.168.255.249
+
     while true; do
         case "$1" in
             --ssid) WIFI_SSID="$2"; shift 2 ;;
@@ -82,15 +84,6 @@ parse_options () {
 
     if [ "$#" -gt 0 ]; then
         abort "Unknown option '$1'"
-    fi
-
-    if [ -z "${CHROMECAST_IP}" ]; then
-        require_cmd ip
-        CHROMECAST_IP=$(ip route show default | cut -d ' ' -f 3)
-    fi
-
-    if [ -z "${CHROMECAST_IP}" ]; then
-        abort "ERROR: IP address not specified"
     fi
 }
 

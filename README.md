@@ -25,7 +25,6 @@ The following external tools are needed:
 * [curl](https://github.com/curl/curl)
 * [jq](https://github.com/stedolan/jq)
 * [openssl](https://github.com/openssl/openssl) (for the `connect-wifi` command).
-* [iproute2](https://git.kernel.org/pub/scm/network/iproute2/iproute2.git) (for detecting the IP address).
 
 ## Use case: changing a Chromecast's Wi-Fi settings
 
